@@ -1,6 +1,6 @@
 # The `servicenow_data` is a hiera 5 `data_hash` data provider function.
 #
-require 'faraday'
+require 'lookup_http'
 require 'json'
 require 'yaml'
 
@@ -17,37 +17,60 @@ Puppet::Functions.create_function(:servicenow_data) do
 #  end
 
   def servicenow_data(options, context)
+
+    result = http_get(context, options)
+
+    answer = result.is_a?(Hash) ? result[key] : result
+    context.not_found if answer.nil?
+    return answer
+  end
+
+  def http_get(options, context)
     instance = options['instance']
     username = options['username']
     password = options['password']
     webservice = options['webservice']
-    path = options['path']
+    uri = URI.parse(options['uri'])
 
-    # Build connection using faradady
-    conn = Faraday.new(url: instance.to_s, ssl: { verify: false }) do |faraday|
-      faraday.request :url_encoded
-      faraday.basic_auth(username.to_s, password.to_s)
-      faraday.response :logger
-      faraday.adapter Faraday.default_adapter
-    end
+    host, port, path = uri.host, uri.port, URI.escape(context.interpolate(uri.request_uri))
 
-    # Build Response using hostname and table name from the constants
-    # def getServiceNowResponse(conn)
-    begin
-      response = conn.get do |req|
-        req.url "#{WEBSERVICE}"
-        req.params['sysparm_query'] = "${PATH}"
-        req.params['sysparm_limit'] = 1
-        req.headers['Content-Type'] = 'application/json'
+    if context.cache_has_key(path)
+      context.explain { "Returning cached value for #{path}" }
+      return context.cached_value(path)
+    else
+      context.explain { "Querying #{uri}" }
+      lookup_params = {}
+      options.each do |k,v|
+        lookup_params[k.to_sym] = v if lookup_supported_params.include?(k.to_sym)
       end
-    rescue Faraday::Error => e
-      raise('ERROR Could not connect to ServiceNow: ' + e)
-    end
+      http_handler = LookupHttp.new(lookup_params.merge({:host => host, :port => port}))
 
-    # For each defined variable in the config file add a facter
-    response.body.to_json
-    #if result['result'].count == 0
-    #  raise("ERROR There is no result in ServiceNow in #{TABLE} for #{OS_HOSTNAME}")
-    #end
+      begin
+        response = http_handler.get_parsed(path)
+        context.cache(path, response)
+        return response
+      rescue LookupHttp::LookupError => e
+        raise Puppet::DataBinding::LookupError, "lookup_http failed #{e.message}"
+      end
+    end
+  end
+
+  def lookup_supported_params
+    [
+      :output,
+      :failure,
+      :ignore_404,
+      :headers,
+      :http_connect_timeout,
+      :http_read_timeout,
+      :use_ssl,
+      :ssl_ca_cert,
+      :ssl_cert,
+      :ssl_key,
+      :ssl_verify,
+      :use_auth,
+      :auth_user,
+      :auth_pass,
+    ]
   end
 end
